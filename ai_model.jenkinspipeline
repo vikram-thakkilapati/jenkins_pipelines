@@ -1,0 +1,151 @@
+// AI / ML model pipeline
+// Checkout -> Python env -> lint & tests -> train -> evaluate (quality gate)
+// -> archive model -> build & push Docker image -> deploy inference service.
+//
+// Expected repo layout (adjust the paths/commands below to your project):
+//   requirements.txt, src/, tests/, train.py, evaluate.py, Dockerfile
+//   evaluate.py writes metrics.json, e.g. {"accuracy": 0.91}
+
+pipeline {
+    agent any
+
+    parameters {
+        string(name: 'GIT_URL',     defaultValue: 'https://github.com/psddevops/ai-model.git', description: 'Model source repository')
+        string(name: 'GIT_BRANCH',  defaultValue: 'main', description: 'Branch to build')
+        string(name: 'MIN_ACCURACY', defaultValue: '0.85', description: 'Quality gate: minimum accuracy to promote the model')
+        booleanParam(name: 'SKIP_TRAINING', defaultValue: false, description: 'Reuse the last archived model instead of retraining')
+        booleanParam(name: 'DEPLOY', defaultValue: true, description: 'Deploy the inference service after a successful build')
+    }
+
+    environment {
+        VENV        = "${WORKSPACE}/.venv"
+        IMAGE_NAME  = 'psddevops/ai-model'
+        IMAGE_TAG   = "${env.BUILD_NUMBER}"
+        DEPLOY_HOST = 'ubuntu@ip-172-31-42-170'
+    }
+
+    options {
+        timestamps()
+        timeout(time: 2, unit: 'HOURS')
+        buildDiscarder(logRotator(numToKeepStr: '10'))
+        disableConcurrentBuilds()
+    }
+
+    stages {
+        stage('GIT Checkout') {
+            steps {
+                git branch: params.GIT_BRANCH, credentialsId: 'github_credentials', url: params.GIT_URL
+            }
+        }
+
+        stage('Setup Python') {
+            steps {
+                sh '''
+                    python3 -m venv "$VENV"
+                    . "$VENV/bin/activate"
+                    pip install --upgrade pip
+                    pip install -r requirements.txt
+                    pip install flake8 pytest
+                '''
+            }
+        }
+
+        stage('Lint & Unit Tests') {
+            parallel {
+                stage('Lint') {
+                    steps {
+                        sh '. "$VENV/bin/activate" && flake8 src/ --max-line-length=120'
+                    }
+                }
+                stage('Unit Tests') {
+                    steps {
+                        sh '. "$VENV/bin/activate" && pytest tests/ --junitxml=reports/junit.xml'
+                    }
+                    post {
+                        always {
+                            junit testResults: 'reports/junit.xml', allowEmptyResults: true
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('Train Model') {
+            when { expression { !params.SKIP_TRAINING } }
+            steps {
+                sh '. "$VENV/bin/activate" && python train.py --output model/'
+            }
+        }
+
+        stage('Reuse Last Model') {
+            when { expression { params.SKIP_TRAINING } }
+            steps {
+                copyArtifacts projectName: env.JOB_NAME, selector: lastSuccessful(), filter: 'model/**'
+            }
+        }
+
+        stage('Evaluate Model') {
+            steps {
+                sh '. "$VENV/bin/activate" && python evaluate.py --model model/ --output metrics.json'
+                script {
+                    def metrics  = readJSON file: 'metrics.json'
+                    def accuracy = metrics.accuracy as Double
+                    def minAcc   = params.MIN_ACCURACY as Double
+                    currentBuild.description = "accuracy=${accuracy}"
+                    echo "Model accuracy: ${accuracy} (required: ${minAcc})"
+                    if (accuracy < minAcc) {
+                        error("Quality gate failed: accuracy ${accuracy} < ${minAcc}")
+                    }
+                }
+            }
+        }
+
+        stage('Archive Model') {
+            steps {
+                archiveArtifacts artifacts: 'model/**, metrics.json', fingerprint: true
+            }
+        }
+
+        stage('Build & Push Image') {
+            steps {
+                withCredentials([usernamePassword(credentialsId: 'dockerhub_credentials',
+                                                  usernameVariable: 'DOCKER_USER',
+                                                  passwordVariable: 'DOCKER_PASS')]) {
+                    sh '''
+                        docker build -t "$IMAGE_NAME:$IMAGE_TAG" -t "$IMAGE_NAME:latest" .
+                        echo "$DOCKER_PASS" | docker login -u "$DOCKER_USER" --password-stdin
+                        docker push "$IMAGE_NAME:$IMAGE_TAG"
+                        docker push "$IMAGE_NAME:latest"
+                    '''
+                }
+            }
+        }
+
+        stage('Deploy') {
+            when { expression { params.DEPLOY } }
+            steps {
+                sshagent(credentials: ['deploy_ssh_key']) {
+                    sh '''
+                        ssh "$DEPLOY_HOST" "
+                            docker pull $IMAGE_NAME:$IMAGE_TAG &&
+                            (docker rm -f ai-model || true) &&
+                            docker run -d --name ai-model --restart unless-stopped -p 8000:8000 $IMAGE_NAME:$IMAGE_TAG
+                        "
+                    '''
+                }
+            }
+        }
+    }
+
+    post {
+        always {
+            sh 'docker logout || true'
+            mail to: 'psddevops1@gmail.com',
+                 subject: "AI pipeline ${currentBuild.currentResult}: ${currentBuild.fullDisplayName}",
+                 body: "${env.BUILD_URL}\nResult: ${currentBuild.currentResult}\n${currentBuild.description ?: ''}"
+        }
+        cleanup {
+            cleanWs()
+        }
+    }
+}
